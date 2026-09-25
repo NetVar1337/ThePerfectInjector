@@ -166,6 +166,10 @@ struct MemoryController
 	uint64_t DirectoryTableBaseOffset;
 	uint64_t ActiveProcessLinksOffset;
 
+	// Discovered lazily, see below.
+	uint64_t ImageFileNameOffset;
+	uint64_t UserDirectoryTableBaseOffset;
+
 	NTSTATUS CreationStatus;
 
 	uint64_t FindEProcess( uint64_t Pid )
@@ -183,6 +187,173 @@ struct MemoryController
 		while ( EProcess != this->CurrentEProcess );
 
 		return 0;
+	}
+
+	// EPROCESS.ImageFileName is a 15 byte buffer. Discover its offset from our own
+	// process so the target can be found by walking the kernel process list instead
+	// of CreateToolhelp32Snapshot (which every AC logs as reconnaissance).
+	uint64_t DiscoverImageFileNameOffset( const char* SelfName )
+	{
+		if ( this->ImageFileNameOffset )
+			return this->ImageFileNameOffset;
+
+		uint64_t Saved = this->TargetDirectoryBase;
+		this->AttachTo( this->CurrentEProcess );
+
+		for ( uint32_t i = 0x20; i < 0x800; i += 8 )
+		{
+			char Buf[ 16 ] = {};
+			this->ReadVirtual( ( PUCHAR ) this->CurrentEProcess + i, Buf, sizeof( Buf ) - 1 );
+
+			if ( Buf[ 0 ] && !strnicmp( Buf, SelfName, 14 ) )
+			{
+				this->ImageFileNameOffset = i;
+				break;
+			}
+		}
+
+		this->TargetDirectoryBase = Saved;
+		return this->ImageFileNameOffset;
+	}
+
+	uint64_t FindEProcessByName( const char* Name )
+	{
+		if ( !this->ImageFileNameOffset )
+			return 0;
+
+		char Want[ 16 ] = {};
+		strncpy_s( Want, Name, 15 );
+
+		uint64_t Saved = this->TargetDirectoryBase;
+		this->AttachTo( this->CurrentEProcess );
+
+		uint64_t Start = this->CurrentEProcess;
+		uint64_t It = Start;
+		uint64_t Found = 0;
+
+		do
+		{
+			char Buf[ 16 ] = {};
+			this->ReadVirtual( ( PUCHAR ) It + this->ImageFileNameOffset, Buf, sizeof( Buf ) - 1 );
+
+			if ( Buf[ 0 ] && !strnicmp( Buf, Want, 14 ) )
+			{
+				Found = It;
+				break;
+			}
+
+			LIST_ENTRY Le = this->ReadVirtual<LIST_ENTRY>( ( PUCHAR ) It + this->ActiveProcessLinksOffset );
+			It = ( uint64_t ) Le.Flink - this->ActiveProcessLinksOffset;
+		}
+		while ( It != Start );
+
+		this->TargetDirectoryBase = Saved;
+		return Found;
+	}
+
+	static constexpr uint64_t Mp_Present = 1ull << 0;
+	static constexpr uint64_t Mp_Rw = 1ull << 1;
+	static constexpr uint64_t Mp_User = 1ull << 2;
+	static constexpr uint64_t Mp_Large = 1ull << 7;
+	static constexpr uint64_t Mp_Xd = 1ull << 63;
+	static constexpr uint64_t Mp_PfnMask = 0x000FFFFFFFFFF000ull;
+
+	void ZeroPhysPage( uint64_t Pa )
+	{
+		if ( ( Pa + 0x1000 ) <= this->PhysicalMemorySize )
+			memset( this->PhysicalMemoryBegin + Pa, 0, 0x1000 );
+	}
+
+	// Under KVA shadow the user CR3 (KPROCESS.DirectoryTableBase) and the kernel
+	// CR3 (KernelDirectoryTableBase) are separate page tables: the user CR3 only
+	// carries a minimal kernel mapping, so flipping U/S bits in the kernel tables
+	// does nothing for CPL3. Discover the user CR3 as a value that is not the
+	// kernel CR3 but still maps the user-visible shared page.
+	uint64_t DiscoverUserDirectoryTableBase( uint64_t EProcess, uint64_t KernelCr3 )
+	{
+		if ( this->UserDirectoryTableBaseOffset )
+			return this->ReadVirtual<uint64_t>( ( PUCHAR ) EProcess + this->UserDirectoryTableBaseOffset );
+
+		for ( uint64_t i = 0x20; i < 0x600; i += 8 )
+		{
+			uint64_t Candidate = this->ReadVirtual<uint64_t>( ( PUCHAR ) EProcess + i );
+
+			if ( !Candidate || Candidate == KernelCr3 )
+				continue;
+			if ( ( Candidate & Mp_PfnMask ) < 0x1000 || ( Candidate & Mp_PfnMask ) > this->PhysicalMemorySize )
+				continue;
+
+			uint64_t Saved = this->TargetDirectoryBase;
+			this->TargetDirectoryBase = Candidate;
+			bool MapsShared = this->VirtToPhys( ( PVOID ) 0x7FFE0000 ) != 0;
+			this->TargetDirectoryBase = Saved;
+
+			if ( MapsShared )
+			{
+				this->UserDirectoryTableBaseOffset = i;
+				return Candidate;
+			}
+		}
+
+		return KernelCr3;
+	}
+
+	// Make Va map Pa in the currently attached page tables with the user bit set,
+	// creating any missing page-table level out of caller-owned frames. Frames
+	// must stay resident and alive for as long as the mapping is used.
+	bool MapUserPage( PVOID Va, uint64_t Pa, bool Executable, bool Writable, const std::function<uint64_t()>& AllocTableFrame )
+	{
+		VIRT_ADDR Addr = { ( uint64_t ) Va };
+		PTE_CR3 Cr3 = { TargetDirectoryBase };
+
+		uint64_t Levels[ 4 ] = { Addr.pml4_index, Addr.pdpt_index, Addr.pd_index, Addr.pt_index };
+		uint64_t TablePa = PFN_TO_PAGE( Cr3.pml4_p );
+
+		for ( int Level = 0; Level < 4; Level++ )
+		{
+			uint64_t EntryPa = TablePa + Levels[ Level ] * 8;
+
+			if ( ( EntryPa + 8 ) > this->PhysicalMemorySize )
+				return false;
+
+			uint64_t Entry = this->ReadPhysicalUnsafe<uint64_t>( EntryPa );
+			bool Leaf = ( Level == 3 );
+
+			if ( !Leaf && ( Entry & Mp_Present ) && ( Entry & Mp_Large ) )
+				return false; // large page in the middle of the chain, refuse instead of splitting
+
+			if ( Leaf )
+			{
+				Entry &= ~Mp_PfnMask;
+				Entry |= ( Pa & Mp_PfnMask );
+				Entry |= Mp_Present | Mp_User;
+				if ( Writable )
+					Entry |= Mp_Rw;
+				else
+					Entry &= ~Mp_Rw;
+				if ( Executable )
+					Entry &= ~Mp_Xd;
+				else
+					Entry |= Mp_Xd;
+			}
+			else
+			{
+				if ( !( Entry & Mp_Present ) )
+				{
+					uint64_t Frame = AllocTableFrame();
+					if ( !Frame )
+						return false;
+					this->ZeroPhysPage( Frame );
+					Entry = ( Frame & Mp_PfnMask ) | Mp_Present;
+				}
+				Entry |= Mp_Rw | Mp_User;
+			}
+
+			this->ReadPhysicalUnsafe<uint64_t>( EntryPa ) = Entry;
+			TablePa = PFN_TO_PAGE( Entry & Mp_PfnMask );
+		}
+
+		return true;
 	}
 
 	void AttachTo( uint64_t EProcess )

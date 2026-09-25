@@ -98,7 +98,7 @@ static NTSTATUS Cl_RemoveSimilarDrivers( BYTE* Driver )
 		std::wstring Path = File.path();
 		if ( Path.find( L".sys" ) != -1 )
 		{
-			std::ifstream FileStr( File, std::ios::binary );
+			std::ifstream FileStr( Path.c_str(), std::ios::binary );
 			char Data[ 1024 ];
 			FileStr.read( Data, 1024 );
 			FileStr.close();
