@@ -10,6 +10,7 @@
 #include "Error.h"
 #include "MemoryController.h"
 #include "SimpleMapper.h"
+#include "PayloadCrypto.h"
 #include "LockedMemory.h"
 #pragma comment(lib, "psapi.lib")
 
@@ -329,6 +330,10 @@ int main( int argc, char**argv )
 	// Map module to kernel and create a hook stub
 	std::vector<std::pair<PVOID, SIZE_T>> UsedRegions;
 	std::vector<BYTE> PageFlags;
+	Mp_Region MappedRegion = {};
+
+	uint8_t PayloadKey[ 32 ], PayloadNonce[ 12 ];
+	Mp_GenerateKey( PayloadKey, PayloadNonce );
 
 	TlsLockedHookController* TlsHookController = Mp_MapDllAndCreateHookEntry( DllPath, _TlsGetValue, Target, AllowLoad, [ & ] ( SIZE_T Size )
 	{
@@ -344,10 +349,18 @@ int main( int argc, char**argv )
 		ZeroMemory( Memory, Size );
 		UsedRegions.push_back( { Memory, Size } );
 		return Memory;
-	}, WipeHeaders, &PageFlags );
+	}, WipeHeaders, &PageFlags, &MappedRegion );
 
 	if ( !TlsHookController )
 		ERROR( "Mapping Failed" );
+
+	// Encrypt the image at rest: the region is only plaintext while the payload
+	// runs, so an idle scanner finds a keystream blob instead of a PE layout.
+	if ( MappedRegion.ImageSize )
+	{
+		Mp_ChaChaApply( ( PVOID ) MappedRegion.ImageBase, MappedRegion.ImageSize, PayloadKey, PayloadNonce );
+		printf( "[+] Payload encrypted at rest (%08x bytes)\n", MappedRegion.ImageSize );
+	}
 
 	// Unload driver
 	Cl_FreeContext( CpCtx );
@@ -508,6 +521,14 @@ int main( int argc, char**argv )
 	else
 		printf( "[-] ERROR: Wait timed out...\n" );
 
+	// Decrypt just before releasing the threads: plaintext exists only for the
+	// execution window.
+	if ( MappedRegion.ImageSize )
+	{
+		Mp_ChaChaApply( ( PVOID ) MappedRegion.ImageBase, MappedRegion.ImageSize, PayloadKey, PayloadNonce );
+		printf( "[+] Payload decrypted for execution\n" );
+	}
+
 	TlsHookController->IsFree = TRUE;
 
 	// Close the shared window as soon as the stub counter drains instead of
@@ -519,6 +540,20 @@ int main( int argc, char**argv )
 
 	WriteTarget( Controller, EProcess, TargetProcess, PadSpace, Backup1.data(), Backup1.size(), PreferHandle );
 	printf( "[-] Padding restored\n" );
+
+	// The counter hitting zero only means every thread passed the gate; the one
+	// that ran the payload is still inside it. Wait for the stub's completion
+	// flag before the image is touched again.
+	TStart = GetTickCount64();
+	while ( !ReadTargetValue<BYTE>( Controller, EProcess, &TlsHookController->Done ) &&
+			( ( GetTickCount64() - TStart ) < 5000 ) )
+		Sleep( 1 );
+
+	if ( MappedRegion.ImageSize )
+	{
+		Mp_ChaChaApply( ( PVOID ) MappedRegion.ImageBase, MappedRegion.ImageSize, PayloadKey, PayloadNonce );
+		printf( "[+] Payload re-encrypted at rest\n" );
+	}
 
 	if ( TargetProcess )
 		CloseHandle( TargetProcess );

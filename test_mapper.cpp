@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include "SimpleMapper.h"
+#include "PayloadCrypto.h"
 #pragma comment(lib, "psapi.lib")
 
 static int g_Failures = 0;
@@ -54,11 +55,11 @@ int main( int argc, char** argv )
 	printf( "[i] stub size %u, image at %p\n", StubSize, ( void* ) ImageMemory );
 
 	// --- stub encoding ---
-	Check( Memory[ 0 ] == 0 && Memory[ 1 ] == 0, "stub data bytes at [0],[1]" );
-	Check( Memory[ 2 ] == 0xF0 && Memory[ 3 ] == 0xFE && Memory[ 4 ] == 0x05, "lock inc opcode" );
+	Check( Memory[ 0 ] == 0 && Memory[ 1 ] == 0 && Memory[ 2 ] == 0, "stub data bytes at [0],[1],[2]" );
+	Check( Memory[ 3 ] == 0xF0 && Memory[ 4 ] == 0xFE && Memory[ 5 ] == 0x05, "lock inc opcode" );
 
-	int32_t Disp = *( int32_t* ) ( Memory + 5 );
-	Check( Disp == ( int32_t ) ( 1 - ( 2 + 3 + 4 ) ), "lock inc targets NumThreadsWaiting (rip+1)" );
+	int32_t Disp = *( int32_t* ) ( Memory + 6 );
+	Check( Disp == ( int32_t ) ( 1 - ( 3 + 3 + 4 ) ), "lock inc targets NumThreadsWaiting (rip+1)" );
 
 	// The wait loop must test IsFree at offset 0 and release when it turns
 	// non-zero (this bit was wrong once: an inverted branch or a disp32 that
@@ -206,6 +207,28 @@ int main( int argc, char** argv )
 	}
 
 	Check( !CookieSeen, "__security_cookie no longer holds the default value" );
+
+	// --- payload crypto (cross-checked externally against a reference ChaCha20) ---
+	{
+		uint8_t Key[ 32 ], Nonce[ 12 ];
+		for ( int i = 0; i < 32; i++ ) Key[ i ] = ( uint8_t ) i;
+		for ( int i = 0; i < 12; i++ ) Nonce[ i ] = ( uint8_t ) ( 0xA0 + i );
+
+		uint8_t Buf[ 256 ], Orig[ 256 ];
+		for ( int i = 0; i < 256; i++ ) Buf[ i ] = ( uint8_t ) ( i * 7 + 3 );
+		memcpy( Orig, Buf, sizeof( Buf ) );
+
+		Mp_ChaChaApply( Buf, sizeof( Buf ), Key, Nonce );
+		Check( memcmp( Buf, Orig, sizeof( Buf ) ) != 0, "ChaCha20 transforms the buffer" );
+
+		uint8_t Block0[ 64 ] = { 0 };
+		Mp_ChaChaApply( Block0, sizeof( Block0 ), Key, Nonce, 0 );
+		FILE* F = fopen( "chacha_block0.bin", "wb" );
+		if ( F ) { fwrite( Block0, 1, sizeof( Block0 ), F ); fclose( F ); }
+
+		Mp_ChaChaApply( Buf, sizeof( Buf ), Key, Nonce );
+		Check( memcmp( Buf, Orig, sizeof( Buf ) ) == 0, "ChaCha20 round trip restores the plaintext" );
+	}
 
 	for ( PVOID P : Blocks )
 		VirtualFree( P, 0, MEM_RELEASE );

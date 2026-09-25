@@ -12,15 +12,28 @@ struct TlsLockedHookController
 {
 	BYTE IsFree;
 	BYTE NumThreadsWaiting;
+	BYTE Done;
 	BYTE EntryBytes;
 };
 #pragma pack(pop)
+
+// Bounds of what the mapper produced: the stub block and the page-aligned
+// image inside it. The image is what gets encrypted at rest; the stub has to
+// stay live because the injector polls its counters.
+struct Mp_Region
+{
+	uint64_t BlockBase;
+	uint32_t BlockSize;
+	uint64_t ImageBase;
+	uint32_t ImageSize;
+};
 
 //
 // Layout of the allocated block (kept identical to the original design):
 //   [0] = IsFree              (data, written by the injector)
 //   [1] = NumThreadsWaiting   (data, written by the stub)
-//   [2] = EntryBytes          (first opcode of the stub, this is the hook target)
+//   [2] = Done                (data, set once the payload has returned)
+//   [3] = EntryBytes          (first opcode of the stub, this is the hook target)
 //   ...
 //   [page aligned] = mapped image
 //
@@ -158,10 +171,11 @@ static std::vector<BYTE> Mp_BuildStub
 	Mp_Asm A;
 
 	// data
-	A.Raw( { 0x00, 0x00 } );
+	A.Raw( { 0x00, 0x00, 0x00 } );
 
 	const size_t IsFree = 0;
 	const size_t NumWaiting = 1;
+	const size_t DoneFlag = 2;
 
 	// lock inc byte [NumWaiting]
 	Mp_X_RipIncByte( A, NumWaiting );
@@ -224,6 +238,8 @@ static std::vector<BYTE> Mp_BuildStub
 	A.Raw( { 0x48, 0x83, 0xE4, 0xF0 } );           // and rsp, ~0xF  (ABI align before call)
 
 	A.Raw( { 0xE8 } ); size_t CallStub = A.Pos(); A.Skip( 4 );  // call payload_entry
+
+	Mp_X_RipIncByte( A, DoneFlag );                // lock inc [Done] once the payload returned
 
 	A.Raw( { 0x48, 0x89, 0xEC } );                 // mov rsp, rbp
 	A.Raw( { 0x9D } );                             // popfq
@@ -474,7 +490,8 @@ static TlsLockedHookController* Mp_MapDllAndCreateHookEntry
 	bool AllowLoad,
 	const std::function<PVOID( SIZE_T )>& MemoryAllocator,
 	bool WipeHeaders = true,
-	std::vector<BYTE>* OutPageFlags = nullptr
+	std::vector<BYTE>* OutPageFlags = nullptr,
+	Mp_Region* OutRegion = nullptr
 )
 {
 	auto File = Mp_ReadFile( Path );
@@ -589,6 +606,14 @@ static TlsLockedHookController* Mp_MapDllAndCreateHookEntry
 
 	if ( WipeHeaders )
 		Mp_WipeHeaders( PBYTE( ImageMemory ) );
+
+	if ( OutRegion )
+	{
+		OutRegion->BlockBase = ( uint64_t ) Memory;
+		OutRegion->BlockSize = ( uint32_t ) ( ( ImageMemory - ( uint64_t ) Memory ) + OptionalHeader->SizeOfImage );
+		OutRegion->ImageBase = ImageMemory;
+		OutRegion->ImageSize = OptionalHeader->SizeOfImage;
+	}
 
 	printf( "[+] Image mapping done!\n" );
 	return ( TlsLockedHookController* ) Memory;

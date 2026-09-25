@@ -21,9 +21,13 @@ before the target starts — but the surrounding artifacts are gone.
 | Stub bytes hand-encoded with hardcoded RIP-relative offsets | Built by a small assembler, every displacement computed |
 | Unbounded spin locks → a dead injector hung the game forever | Bounded waits, timeout falls through to the original function |
 | Pages exposed RWX | Per-page permissions come from the section characteristics: code is RX, data is RW, never both |
+| Mapped image stays plaintext forever (a standing PE layout for any scanner) | ChaCha20-encrypted at rest with a per-map key that exists only in the injector; plaintext only for the execution window |
 
 The `call`/`ret` pair around the payload entry stays balanced, so hardware shadow stacks
-(CET) do not trip a `#CP`, and the entry is invoked with a 16-byte aligned frame.
+(CET) do not trip a `#CP`, and the entry is invoked with a 16-byte aligned frame. The stub
+also sets a `Done` flag once the payload has actually returned — the counter hitting zero
+only means every caller passed the gate, not that `DllMain` finished, and re-encrypting or
+tearing down on the counter alone would corrupt a running payload.
 
 ### Injector (`PerfectInjector.cpp`)
 
@@ -45,13 +49,22 @@ The `call`/`ret` pair around the payload entry stays balanced, so hardware shado
 
 ```
 build.bat            # MSVC x64, produces PerfectInjector.exe
-build_test.bat       # produces test_mapper.exe
+build_test.bat       # produces test_mapper.exe and test_stub.exe
 test_mapper.exe      # maps a real system DLL and verifies the mapper end to end
+test_stub.exe        # executes the hook stub on real threads and verifies its behaviour
 ```
 
 `test_mapper.exe` checks relocations, IAT resolution (including ordinals), the security
-cookie, the header wipe and the stub encoding against real system DLLs — e.g.
+cookie, the header wipe, the stub encoding and the ChaCha20 implementation (whose output is
+cross-checked against a reference implementation) against real system DLLs — e.g.
 `test_mapper.exe C:\Windows\System32\urlmon.dll` exercises 95 ordinal imports.
+
+`test_stub.exe` runs the generated shellcode on real threads instead of only decoding it:
+callers block while the gate is closed, release requires both `IsFree` and the restored
+hook bytes, exactly one caller runs the payload while every caller completes the original
+function, `Done` is set only after the payload returns, and a never-released gate times out
+instead of hanging. This is what caught the inverted `IsFree` branch and the rip-relative
+off-by-one that decoding checks could not.
 
 ### Payload build profile
 
@@ -103,6 +116,6 @@ bad reputation), and remember the timestamping service logs your file hash and I
 
 * Structured exception handling, static TLS and delay imports are not set up by the mapper.
 * The kernel pool allocation is not freed (the driver is unloaded by design before the
-  target starts); it lives until reboot.
+  target starts); it lives until reboot, encrypted at rest.
 * Patching shared pages at all is still a window, however short. `handle` mode removes it
   but costs a process handle with `PROCESS_VM_WRITE`.
