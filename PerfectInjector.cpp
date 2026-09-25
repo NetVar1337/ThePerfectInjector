@@ -11,6 +11,7 @@
 #include "MemoryController.h"
 #include "SimpleMapper.h"
 #include "PayloadCrypto.h"
+#include "Preflight.h"
 #include "LockedMemory.h"
 #pragma comment(lib, "psapi.lib")
 
@@ -80,7 +81,7 @@ static std::function<uint64_t()> MakeTableFrameAllocator( MemoryController& Mc )
 	};
 }
 
-static BOOL ExposeKernelMemoryToProcess( MemoryController& Mc, PVOID Memory, SIZE_T Size, uint64_t EProcess, const std::vector<BYTE>& PageFlags )
+static BOOL ExposeKernelMemoryToProcess( MemoryController& Mc, PVOID Memory, SIZE_T Size, uint64_t EProcess, const std::vector<BYTE>& PageFlags, bool AllowSharedTables )
 {
 	uint64_t KernelCr3 = Mc.ReadVirtual<uint64_t>( ( PUCHAR ) EProcess + Mc.DirectoryTableBaseOffset );
 
@@ -88,9 +89,22 @@ static BOOL ExposeKernelMemoryToProcess( MemoryController& Mc, PVOID Memory, SIZ
 		KernelCr3 = Mc.CurrentDirectoryBase;
 
 	uint64_t UserCr3 = Mc.DiscoverUserDirectoryTableBase( EProcess, KernelCr3 );
+	bool Kvas = ( UserCr3 != KernelCr3 );
 
 	printf( "[+] Cr3: kernel %016llx user %016llx%s\n",
-		KernelCr3, UserCr3, ( UserCr3 != KernelCr3 ) ? " (kva shadow)" : "" );
+		KernelCr3, UserCr3, Kvas ? " (kva shadow)" : "" );
+
+	// Without KVA shadow the kernel-half page tables are shared by every
+	// process: exposing pages there flips U/S bits in tables that belong to the
+	// whole system. That is exactly the kind of write that ends in a bugcheck or
+	// silent corruption, so it is refused unless explicitly overridden.
+	if ( !Kvas && !AllowSharedTables )
+	{
+		printf( "[!] KVA shadow is off: kernel page tables are shared between processes.\n" );
+		printf( "[!] Refusing to modify shared page tables. Re-run with --allow-shared-tables\n" );
+		printf( "[!] if you accept that risk, or use a machine with KVA shadow enabled.\n" );
+		return FALSE;
+	}
 
 	auto Alloc = MakeTableFrameAllocator( Mc );
 	BOOL Success = TRUE;
@@ -113,14 +127,16 @@ static BOOL ExposeKernelMemoryToProcess( MemoryController& Mc, PVOID Memory, SIZ
 		bool Executable = ( Flags & 0x1 ) != 0;
 		bool Writable = ( Flags & 0x2 ) != 0;
 
-		if ( !Mc.MapUserPage( Va, Pa, Executable, Writable, Alloc ) )
+		// The kernel-cr3 side is only touched when KVA shadow is confirmed: the
+		// tables there are per-process shadow tables in that case.
+		if ( !Mc.MapUserPage( Va, Pa, Executable, Writable, Alloc, Mc.CurrentDirectoryBase, true ) )
 			Success = FALSE;
 
-		if ( UserCr3 != KernelCr3 )
+		if ( Kvas )
 		{
 			Mc.TargetDirectoryBase = UserCr3;
 
-			if ( !Mc.MapUserPage( Va, Pa, Executable, Writable, Alloc ) )
+			if ( !Mc.MapUserPage( Va, Pa, Executable, Writable, Alloc, Mc.CurrentDirectoryBase, true ) )
 			{
 				Success = FALSE;
 			}
@@ -220,6 +236,21 @@ static SIZE_T ReadTarget( MemoryController& Mc, uint64_t EProcess, PVOID Src, PV
 	return Mc.ReadVirtual( Src, Dst, Size );
 }
 
+static bool WriteTargetChecked( MemoryController& Mc, uint64_t EProcess, HANDLE Process, PVOID Dst, const void* Src, SIZE_T Size, bool PreferHandle )
+{
+	if ( !WriteTarget( Mc, EProcess, Process, Dst, Src, Size, PreferHandle ) )
+		return false;
+
+	// Read back before trusting the write: a failed translation must never leave
+	// a half-installed hook behind.
+	std::vector<BYTE> Round( Size );
+
+	if ( ReadTarget( Mc, EProcess, Dst, Round.data(), Size ) != Size )
+		return false;
+
+	return memcmp( Round.data(), Src, Size ) == 0;
+}
+
 template<typename T>
 static T ReadTargetValue( MemoryController& Mc, uint64_t EProcess, PVOID Src )
 {
@@ -244,24 +275,57 @@ static const char* ConHdr = "=================================================\n
 
 int main( int argc, char**argv )
 {
-	std::string ProcessName = argc > 1 ? argv[ 1 ] : "";
-	std::string DllPath = argc > 2 ? argv[ 2 ] : "";
+	std::string ProcessName;
+	std::string DllPath;
 
 	// flags: noloadlib keepheaders toolhelp hotkey handle quiet pid=<n> waitkey
+	//        preflight allow-shared-tables   (also accepted with a -- prefix)
 
 	std::map<std::string, bool> Flags;
 	uint64_t ExplicitPid = 0;
 
-	for ( int i = 3; i < argc; i++ )
+	for ( int i = 1; i < argc; i++ )
 	{
 		std::string Str = argv[ i ];
-		for ( auto& c : Str )
+		std::string Lower = Str;
+		for ( auto& c : Lower )
 			c = tolower( c );
 
-		if ( Str.rfind( "pid=", 0 ) == 0 )
-			ExplicitPid = strtoull( Str.c_str() + 4, nullptr, 0 );
+		// Anything prefixed with -- is a flag; bare arguments are positional
+		// (process name, module path) until both are filled, then flags.
+		bool IsFlag = ( Lower.rfind( "--", 0 ) == 0 ) ||
+					  ( Lower.rfind( "pid=", 0 ) == 0 ) ||
+					  ( ProcessName.size() && DllPath.size() );
+
+		if ( IsFlag )
+		{
+			if ( Lower.rfind( "--", 0 ) == 0 )
+				Lower = Lower.substr( 2 );
+
+			if ( Lower.rfind( "pid=", 0 ) == 0 )
+				ExplicitPid = strtoull( Lower.c_str() + 4, nullptr, 0 );
+			else
+				Flags[ Lower ] = true;
+		}
+		else if ( !ProcessName.size() )
+			ProcessName = Str;
 		else
-			Flags[ Str ] = true;
+			DllPath = Str;
+	}
+
+	// Safety gate. Read-only checks, run before the driver, the physical map or
+	// any write. The tool refuses to continue in configurations where the
+	// technique is known to bugcheck (HVCI / Memory Integrity) or to corrupt
+	// shared page tables (KVA shadow off).
+	{
+		Mp_Preflight Pf = Mp_RunPreflight();
+		Mp_PrintPreflight( Pf );
+
+		if ( Flags[ "preflight" ] )
+			return Pf.Blocked ? 1 : 0;
+
+		if ( Pf.Blocked )
+			return 1;
 	}
 
 	SetConsoleTextAttribute( GetStdHandle( STD_OUTPUT_HANDLE ), 0xF );
@@ -286,7 +350,7 @@ int main( int argc, char**argv )
 
 	printf( "Flags:         " );
 
-	for ( int i = 3; i < argc; i++ )
+	for ( int i = 1; i < argc; i++ )
 		printf( "'%s' ", argv[ i ] );
 	printf( "\n" );
 
@@ -299,6 +363,7 @@ int main( int argc, char**argv )
 	const bool PreferHandle = Flags[ "handle" ] || Flags[ "hookmode:handle" ];
 	const bool WipeHeaders = !Flags[ "keepheaders" ];
 	const bool AllowLoad = !Flags[ "noloadlib" ];
+	const bool AllowSharedTables = Flags[ "allow-shared-tables" ];
 
 	// Initialize physical memory controller
 	SetConsoleTextAttribute( GetStdHandle( STD_OUTPUT_HANDLE ), 12 );
@@ -335,7 +400,7 @@ int main( int argc, char**argv )
 	uint8_t PayloadKey[ 32 ], PayloadNonce[ 12 ];
 	Mp_GenerateKey( PayloadKey, PayloadNonce );
 
-	TlsLockedHookController* TlsHookController = Mp_MapDllAndCreateHookEntry( DllPath, _TlsGetValue, Target, AllowLoad, [ & ] ( SIZE_T Size )
+	TlsLockedHookController* TlsHookController = Mp_MapDllAndCreateHookEntry( DllPath, _TlsGetValue, Target, AllowLoad, [ & ] ( SIZE_T Size ) -> PVOID
 	{
 		PVOID Memory = AllocateKernelMemory( CpCtx, KrCtx, Size );
 
@@ -345,7 +410,15 @@ int main( int argc, char**argv )
 		// The injector itself needs a writable mapping of the region: the stub,
 		// the relocations and the IAT are written through this window.
 		std::vector<BYTE> AllWrite( ( Size + 0xFFF ) / 0x1000, 0x2 );
-		ExposeKernelMemoryToProcess( Controller, Memory, Size, Controller.CurrentEProcess, AllWrite );
+
+		// If the region cannot be exposed safely, abort the mapping instead of
+		// handing back memory the target would fault on later.
+		if ( !ExposeKernelMemoryToProcess( Controller, Memory, Size, Controller.CurrentEProcess, AllWrite, AllowSharedTables ) )
+		{
+			printf( "[!] Exposure to the injector failed, aborting the mapping\n" );
+			return nullptr;
+		}
+
 		ZeroMemory( Memory, Size );
 		UsedRegions.push_back( { Memory, Size } );
 		return Memory;
@@ -407,12 +480,14 @@ int main( int argc, char**argv )
 
 	printf( "[-] EProcess:                               %16llx\n", EProcess );
 
-	// Expose region to process
+	// Expose region to process. This must succeed before anything is hooked: if
+	// the target cannot reach the stub, the next call into the hook is a fault
+	// in the game, so failure here is fatal rather than a warning.
 	for ( auto Region : UsedRegions )
 	{
 		printf( "[-] Exposing %16llx (%08llx bytes) to the target\n", ( uint64_t ) Region.first, ( uint64_t ) Region.second );
-		if ( !ExposeKernelMemoryToProcess( Controller, Region.first, Region.second, EProcess, PageFlags ) )
-			printf( "[!] Exposure reported a problem, check the Cr3 lines above\n" );
+		if ( !ExposeKernelMemoryToProcess( Controller, Region.first, Region.second, EProcess, PageFlags, AllowSharedTables ) )
+			ERROR( "Exposure failed, refusing to install the hook" );
 	}
 
 	std::vector<BYTE> PidBasedHook =
@@ -449,8 +524,14 @@ int main( int argc, char**argv )
 	std::vector<BYTE> Backup1( PidBasedHook.size(), 0 );
 	std::vector<BYTE> Backup2( 5, 0 );
 
-	TlsHookController->NumThreadsWaiting = 0;
-	TlsHookController->IsFree = FALSE;
+	{
+		BYTE Zero = 0;
+		// The process handle is opened further down, so these go through the
+		// physical path regardless of --handle.
+		if ( !WriteTargetChecked( Controller, EProcess, nullptr, &TlsHookController->NumThreadsWaiting, &Zero, 1, false ) ||
+			 !WriteTargetChecked( Controller, EProcess, nullptr, &TlsHookController->IsFree, &Zero, 1, false ) )
+			ERROR( "Failed to initialise the stub counters" );
+	}
 
 	Controller.Detach();
 
@@ -479,13 +560,19 @@ int main( int argc, char**argv )
 
 	printf( "[-] Writing stub to padding...\n" );
 	ReadTarget( Controller, EProcess, PadSpace, Backup1.data(), PidBasedHook.size() );
-	if ( !WriteTarget( Controller, EProcess, TargetProcess, PadSpace, PidBasedHook.data(), PidBasedHook.size(), PreferHandle ) )
+	if ( !WriteTargetChecked( Controller, EProcess, TargetProcess, PadSpace, PidBasedHook.data(), PidBasedHook.size(), PreferHandle ) )
 		ERROR( "Failed to write the pid check stub" );
 
 	printf( "[-] Writing the hook to TlsGetValue...\n" );
 	ReadTarget( Controller, EProcess, _TlsGetValue, Backup2.data(), 5 );
-	if ( !WriteTarget( Controller, EProcess, TargetProcess, _TlsGetValue, Jmp, 5, PreferHandle ) )
+	if ( !WriteTargetChecked( Controller, EProcess, TargetProcess, _TlsGetValue, Jmp, 5, PreferHandle ) )
+	{
+		// Roll the padding back before leaving: every process executes those
+		// bytes, so a partial install must never survive an error path.
+		printf( "[!] Hook write failed, restoring the padding\n" );
+		WriteTarget( Controller, EProcess, TargetProcess, PadSpace, Backup1.data(), Backup1.size(), PreferHandle );
 		ERROR( "Failed to write the hook" );
+	}
 
 	// Report whether the patched pages are actually private to the target. A
 	// changed PFN means copy-on-write was broken and no other process can see
@@ -529,7 +616,11 @@ int main( int argc, char**argv )
 		printf( "[+] Payload decrypted for execution\n" );
 	}
 
-	TlsHookController->IsFree = TRUE;
+	{
+		BYTE One = 1;
+		if ( !WriteTargetChecked( Controller, EProcess, TargetProcess, &TlsHookController->IsFree, &One, 1, PreferHandle ) )
+			printf( "[!] Failed to release the stub gate\n" );
+	}
 
 	// Close the shared window as soon as the stub counter drains instead of
 	// holding the modified padding for a fixed sleep.

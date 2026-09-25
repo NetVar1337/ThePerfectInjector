@@ -40,6 +40,13 @@ NON_PAGED_DATA static UCHAR Kh_PassiveCallStubData[] =
 NON_PAGED_CODE static void Khk_AllocatePassiveStub()
 {
 	PVOID Out = ( PVOID ) Khk_ExAllocatePool( 0ull, sizeof( Kh_PassiveCallStubData ) );
+
+	// A failed pool allocation would otherwise be copied to in kernel mode:
+	// a null dereference at passive level bugchecks the machine. Leaving the
+	// stub pointer null makes every later call fail soft instead.
+	if ( !Out )
+		return;
+
 	Np_memcpy( Out, Kh_PassiveCallStubData, sizeof( Kh_PassiveCallStubData ) );
 	Khk_PassiveCallStub = ( fnPassiveCall ) Out;
 }
@@ -47,6 +54,9 @@ NON_PAGED_CODE static void Khk_AllocatePassiveStub()
 template<typename ...Params>
 NON_PAGED_CODE static uint64_t Khk_CallPassive( PVOID Ptr, Params &&... params )
 {
+	if ( !Khk_PassiveCallStub )
+		return 0xC0000001ull; // STATUS_UNSUCCESSFUL, never jump through a null stub
+
 	*( PVOID* ) ( ( ( PUCHAR ) Khk_PassiveCallStub ) + Kh_PassiveCallStubCallStoreOffset ) = Ptr;
 	return Khk_PassiveCallStub( std::forward<Params>( params ) ... );
 }

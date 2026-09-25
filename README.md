@@ -112,6 +112,39 @@ When signing anything: check revocation yourself (CRL/OCSP, `certutil -verify -u
 certificate is not already burned (present on VirusTotal with malware ⇒ it drags a known
 bad reputation), and remember the timestamping service logs your file hash and IP.
 
+### Safety
+
+This project writes page tables and runs code in kernel context, so it has real bugcheck
+potential. The tool is built to refuse rather than to push on:
+
+* **Environment gate before anything happens.** `--preflight` runs the read-only checks and
+  exits; a normal run executes the same checks and refuses to start when they fail.
+  - **HVCI / Memory Integrity enabled → hard stop.** The passive-call stub is copied into
+    pool memory and executed; pool pages are non-executable under HVCI, so that path is a
+    guaranteed kernel fault. The tool will not touch it.
+  - **KVA shadow off → hard stop** (overridable with `--allow-shared-tables`). Without KVA
+    shadow the kernel-half page tables are shared by every process: flipping U/S bits there
+    changes all address spaces at once. Refused by default.
+  - Not elevated, or a pre-Windows-10 build → hard stop (the failure would be later and
+    messier, so it fails early instead).
+* **Page-table writes are ownership-checked.** Before a non-leaf entry is modified, the same
+  entry is resolved under a reference address space; if the table page is shared the write
+  is refused. Every entry written is read back and verified, and a frame that is out of
+  range or not page-aligned is never wired into an entry.
+* **Every write is verified and rolled back.** Hook and stub-state writes are read back and
+  compared; a failed hook write restores the padding before exiting, so a partial install
+  never survives an error path. If the target cannot reach the stub, the tool refuses to
+  install the hook at all rather than letting the next call fault in the game.
+* **Kernel side fails soft.** A failed pool allocation no longer gets copied to in kernel
+  mode, and the passive-call stub is never invoked through a null pointer. All waits and
+  spin loops are bounded.
+* **No RWX pages** in the target, and the payload is encrypted at rest.
+
+What remains irreducible: the initial kernel primitive is a vulnerable driver executing a
+callback. The checks above cover the known bugcheck paths (pool execution under HVCI, shared
+page-table corruption, half-installed hooks, unbounded spins), but a bug inside that
+primitive itself is still a bugcheck — run it in a VM first if the target machine matters.
+
 ### Known limitations
 
 * Structured exception handling, static TLS and delay imports are not set up by the mapper.

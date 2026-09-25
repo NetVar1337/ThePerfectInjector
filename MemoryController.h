@@ -301,13 +301,34 @@ struct MemoryController
 	// Make Va map Pa in the currently attached page tables with the user bit set,
 	// creating any missing page-table level out of caller-owned frames. Frames
 	// must stay resident and alive for as long as the mapping is used.
-	bool MapUserPage( PVOID Va, uint64_t Pa, bool Executable, bool Writable, const std::function<uint64_t()>& AllocTableFrame )
+	//
+	// Safety: kernel-half page tables are shared between processes, so writing
+	// them changes every address space at once and is a corruption/bugcheck
+	// risk. When ReferenceCr3 is supplied and RequirePrivate is set, every entry
+	// about to be modified is compared against the same entry under ReferenceCr3:
+	// an entry whose table page is shared is refused instead of written. Every
+	// write is read back and verified before the function reports success.
+	bool MapUserPage
+	(
+		PVOID Va,
+		uint64_t Pa,
+		bool Executable,
+		bool Writable,
+		const std::function<uint64_t()>& AllocTableFrame,
+		uint64_t ReferenceCr3 = 0,
+		bool RequirePrivate = true
+	)
 	{
+		if ( ( Pa & 0xFFF ) || ( Pa + 0x1000 ) > this->PhysicalMemorySize )
+			return false; // never wire a page-table entry to an out of range frame
+
 		VIRT_ADDR Addr = { ( uint64_t ) Va };
 		PTE_CR3 Cr3 = { TargetDirectoryBase };
+		PTE_CR3 RefCr3 = { ReferenceCr3 };
 
 		uint64_t Levels[ 4 ] = { Addr.pml4_index, Addr.pdpt_index, Addr.pd_index, Addr.pt_index };
 		uint64_t TablePa = PFN_TO_PAGE( Cr3.pml4_p );
+		uint64_t RefTablePa = ReferenceCr3 ? PFN_TO_PAGE( RefCr3.pml4_p ) : 0;
 
 		for ( int Level = 0; Level < 4; Level++ )
 		{
@@ -321,6 +342,27 @@ struct MemoryController
 
 			if ( !Leaf && ( Entry & Mp_Present ) && ( Entry & Mp_Large ) )
 				return false; // large page in the middle of the chain, refuse instead of splitting
+
+			bool CreatedHere = false;
+
+			// Shared-table check: the table page backing this entry is shared if
+			// the reference address space resolves the same level to the same
+			// physical page.
+			if ( RequirePrivate && ReferenceCr3 && RefTablePa && ( Entry & Mp_Present ) )
+			{
+				uint64_t RefEntryPa = RefTablePa + Levels[ Level ] * 8;
+
+				if ( ( RefEntryPa + 8 ) <= this->PhysicalMemorySize )
+				{
+					uint64_t RefEntry = this->ReadPhysicalUnsafe<uint64_t>( RefEntryPa );
+
+					if ( ( RefEntry & Mp_Present ) && ( RefEntry & Mp_PfnMask ) == ( Entry & Mp_PfnMask ) )
+					{
+						printf( "[!] Refusing to modify a shared page-table entry (level %d, va %p)\n", Level, Va );
+						return false;
+					}
+				}
+			}
 
 			if ( Leaf )
 			{
@@ -345,12 +387,33 @@ struct MemoryController
 						return false;
 					this->ZeroPhysPage( Frame );
 					Entry = ( Frame & Mp_PfnMask ) | Mp_Present;
+					CreatedHere = true;
 				}
 				Entry |= Mp_Rw | Mp_User;
 			}
 
 			this->ReadPhysicalUnsafe<uint64_t>( EntryPa ) = Entry;
+
+			// Read back before trusting the write: a bad translation on this side
+			// would otherwise silently corrupt whatever EntryPa really points at.
+			uint64_t Verify = this->ReadPhysicalUnsafe<uint64_t>( EntryPa );
+			if ( Verify != Entry )
+			{
+				printf( "[!] Page-table write verification failed (level %d, va %p)\n", Level, Va );
+				return false;
+			}
+
 			TablePa = PFN_TO_PAGE( Entry & Mp_PfnMask );
+
+			if ( RefTablePa )
+			{
+				uint64_t RefEntry = 0;
+				uint64_t RefEntryPa = RefTablePa + Levels[ Level ] * 8;
+				if ( ( RefEntryPa + 8 ) <= this->PhysicalMemorySize )
+					RefEntry = this->ReadPhysicalUnsafe<uint64_t>( RefEntryPa );
+				RefTablePa = ( RefEntry & Mp_Present ) ? PFN_TO_PAGE( RefEntry & Mp_PfnMask ) : 0;
+				( void ) CreatedHere;
+			}
 		}
 
 		return true;
